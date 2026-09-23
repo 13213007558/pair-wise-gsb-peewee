@@ -104,6 +104,8 @@ try:
     MODULES.append(sqlite)
 except ImportError:
     print('Unable to import sqlite extension tests, skipping.')
+from . import sqlite_budget
+MODULES.append(sqlite_budget)
 try:
     from . import sqlite_changelog
     MODULES.append(sqlite_changelog)
