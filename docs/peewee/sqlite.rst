@@ -333,6 +333,69 @@ Example:
 To support shared libraries, your SQLite3 will need to have been compiled with
 support for run-time loadable extensions.
 
++
+.. _sqlite-execution-budget:
+
+Query Execution Budgets
+-----------------------
+
+.. module:: playhouse.sqlite_budget
+
+Some user-generated queries can run for a very long time in SQLite. The
+:mod:`playhouse.sqlite_budget` module provides a nestable context-manager,
+:class:`QueryBudget`, that installs a temporary SQLite *progress handler* on
+a Peewee connection. While the budget is active, a query is aborted once it
+exceeds a wall-clock deadline or a virtual-machine instruction limit. When
+the context exits, the previous progress handler -- including one registered
+by the application itself -- is restored.
+
+Both the standard-library ``sqlite3`` driver and APSW
+(:class:`playhouse.apsw_ext.APSWDatabase`) share the same interface. Drivers
+that do not expose a progress-handler API raise
+:py:class:`NotSupportedError`.
+
+.. code-block:: python
+
+    from playhouse.sqlite_budget import BudgetExceeded, QueryBudget
+
+    try:
+        with QueryBudget(db, max_instructions=10 ** 6, name='report'):
+            run_user_query()
+    except BudgetExceeded as exc:
+        logger.warning('budget exhausted: %s', exc.budget.describe())
+
+Budgets may be limited by:
+
+* ``max_instructions`` -- approximate number of SQLite virtual-machine
+  instructions a query may execute.
+* ``deadline`` -- an absolute ``time.monotonic()`` timestamp after which
+  queries are aborted.
+* ``timeout`` -- a convenience alternative to ``deadline`` given in seconds
+  relative to entering the context.
+
+Budgets can be nested; when several layers are active, whichever limit is
+reached first aborts the query, and the raised :class:`BudgetExceeded`
+identifies the layer whose budget was exhausted via its ``budget``
+attribute:
+
+.. code-block:: python
+
+    with QueryBudget(db, timeout=30, name='request'):
+        with QueryBudget(db, max_instructions=10 ** 5, name='statement'):
+            run_user_query()
+
+:class:`BudgetExceeded` subclasses :py:class:`OperationalError`, so existing
+error handling keeps working, but callers can catch it specifically to
+distinguish a budget interruption from an ordinary SQL error. After an
+abort, the transaction state reflects whatever SQLite actually did --
+statements inside :py:meth:`Database.atomic` are rolled back as usual, and
+the connection remains usable for subsequent queries.
+
+If the application registers its own progress handler, use
+:func:`set_progress_handler` (and :func:`clear_progress_handler`) from this
+module. Handlers registered this way remain active while a budget is in
+effect and are restored when the budget exits.
+
 .. _sqlite-locking-mode:
 
 Locking Mode for Transactions
@@ -2638,4 +2701,3 @@ Available functions
    SequenceMatcher's algorithm.
 
    .. note:: Only available if you compiled the ``_sqlite_udf`` extension.
-
