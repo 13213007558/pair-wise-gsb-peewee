@@ -107,6 +107,19 @@ class ContentPost5(FTS5Model):
         options = {'content': Post, 'content_rowid': Post.id}
 
 
+class SyncNote(TestModel):
+    title = TextField()
+    body = TextField()
+
+
+class SyncNoteIdx(FTS5Model):
+    title = SearchField()
+    body = SearchField()
+    class Meta:
+        legacy_table_names = False
+        options = {'content': SyncNote, 'content_rowid': SyncNote.id}
+
+
 class FTS5Contentless(FTS5Model):
     title = SearchField()
     data = SearchField()
@@ -1629,6 +1642,237 @@ class TestFTS5(BaseFTSTestCase, ModelTestCase):
         )
         for a, b in cases:
             self.assertEqual(FTS5Test.clean_query(a), b)
+
+
+@skip_unless(FTS5Model.fts5_installed(), 'requires fts5')
+class TestFTS5SyncTriggers(ModelTestCase):
+    database = ext_database
+    requires = [SyncNote, SyncNoteIdx]
+
+    def tearDown(self):
+        # Sync triggers survive the content table being dropped only if the
+        # drop failed, but make sure nothing leaks between tests.
+        SyncNoteIdx.remove_sync_triggers()
+        super(TestFTS5SyncTriggers, self).tearDown()
+
+    def match_set(self, term):
+        query = SyncNoteIdx.select().where(SyncNoteIdx.match(term))
+        return sorted(r.rowid for r in query)
+
+    def assertIndexInSync(self, *terms):
+        # The trigger-maintained index must answer MATCH exactly like an
+        # index rebuilt from the content table in a single transaction.
+        expected = dict((term, self.match_set(term)) for term in terms)
+        SyncNoteIdx.rebuild_index()
+        for term in terms:
+            self.assertEqual(self.match_set(term), expected[term])
+        SyncNoteIdx.integrity_check(rank=1)
+
+    def trigger_rows(self, database=None):
+        database = database or self.database
+        return database.execute_sql(
+            'SELECT name, tbl_name, sql FROM sqlite_master '
+            "WHERE type = 'trigger' ORDER BY name").fetchall()
+
+    def test_sync_triggers_sql(self):
+        self.assertEqual(SyncNoteIdx.sync_triggers_sql(), {
+            'sync_note_idx_ai':
+                'CREATE TRIGGER "sync_note_idx_ai" AFTER INSERT ON '
+                '"sync_note" BEGIN\n'
+                '  INSERT INTO "sync_note_idx"("rowid", "title", "body") '
+                'VALUES (new."id", new."title", new."body");\n'
+                'END',
+            'sync_note_idx_ad':
+                'CREATE TRIGGER "sync_note_idx_ad" AFTER DELETE ON '
+                '"sync_note" BEGIN\n'
+                '  INSERT INTO "sync_note_idx"("sync_note_idx", "rowid", '
+                '"title", "body") '
+                "VALUES('delete', old.\"id\", old.\"title\", old.\"body\");\n"
+                'END',
+            'sync_note_idx_au':
+                'CREATE TRIGGER "sync_note_idx_au" AFTER UPDATE ON '
+                '"sync_note" BEGIN\n'
+                '  INSERT INTO "sync_note_idx"("sync_note_idx", "rowid", '
+                '"title", "body") '
+                "VALUES('delete', old.\"id\", old.\"title\", old.\"body\");\n"
+                '  INSERT INTO "sync_note_idx"("rowid", "title", "body") '
+                'VALUES (new."id", new."title", new."body");\n'
+                'END'})
+
+    def test_sync_triggers_sql_explicit_args(self):
+        # Explicit content model, rowid source and fields (as fields or
+        # names) generate the same definitions as the Meta defaults.
+        default = SyncNoteIdx.sync_triggers_sql()
+        self.assertEqual(
+            SyncNoteIdx.sync_triggers_sql(
+                SyncNote, SyncNote.id,
+                [SyncNoteIdx.title, SyncNoteIdx.body]),
+            default)
+        self.assertEqual(
+            SyncNoteIdx.sync_triggers_sql(SyncNote, 'id', ['title', 'body']),
+            default)
+
+    def test_sync_triggers_sql_validation(self):
+        # No content model available.
+        self.assertRaises(ImproperlyConfigured, FTS5Test.sync_triggers_sql)
+        # A subset that omits an indexed column cannot drive the triggers.
+        self.assertRaises(ImproperlyConfigured,
+                          SyncNoteIdx.sync_triggers_sql,
+                          fields=[SyncNoteIdx.title])
+        # Unknown field for this index model.
+        self.assertRaises(ImproperlyConfigured,
+                          SyncNoteIdx.sync_triggers_sql,
+                          fields=[SyncNoteIdx.title, FTS5Test.data])
+
+        class MissingColumn(FTS5Model):
+            title = SearchField()
+            oops = SearchField()
+            class Meta:
+                options = {'content': SyncNote}
+
+        self.assertRaises(ImproperlyConfigured,
+                          MissingColumn.sync_triggers_sql)
+
+    def test_install_check_remove(self):
+        self.assertFalse(SyncNoteIdx.sync_triggers_installed())
+        SyncNoteIdx.install_sync_triggers()
+        self.assertTrue(SyncNoteIdx.sync_triggers_installed())
+        self.assertEqual(
+            [r[0] for r in self.trigger_rows()],
+            ['sync_note_idx_ad', 'sync_note_idx_ai', 'sync_note_idx_au'])
+
+        # Re-installing is a no-op and does not create a second set.
+        SyncNoteIdx.install_sync_triggers()
+        self.assertEqual(len(self.trigger_rows()), 3)
+
+        # Installing enabled recursive_triggers so that INSERT OR REPLACE
+        # fires the delete trigger.
+        self.assertEqual(self.database.pragma('recursive_triggers'), 1)
+
+        dropped = SyncNoteIdx.remove_sync_triggers()
+        self.assertEqual(dropped, ['sync_note_idx_ai', 'sync_note_idx_ad',
+                                   'sync_note_idx_au'])
+        self.assertFalse(SyncNoteIdx.sync_triggers_installed())
+        self.assertEqual(self.trigger_rows(), [])
+        # The content table and its rows are untouched.
+        self.assertTrue(self.database.table_exists('sync_note'))
+
+    def test_remove_leaves_application_triggers(self):
+        SyncNoteIdx.install_sync_triggers()
+        self.database.execute_sql(
+            'CREATE TRIGGER "note_app_trigger" AFTER INSERT ON "sync_note" '
+            'BEGIN SELECT 1; END')
+        dropped = SyncNoteIdx.remove_sync_triggers()
+        self.assertEqual(len(dropped), 3)
+        self.assertEqual([r[0] for r in self.trigger_rows()],
+                         ['note_app_trigger'])
+        self.database.execute_sql('DROP TRIGGER "note_app_trigger"')
+
+    def test_install_conflict(self):
+        # A same-named trigger with a different definition is a conflict.
+        self.database.execute_sql(
+            'CREATE TRIGGER "sync_note_idx_ai" AFTER INSERT ON "sync_note" '
+            'BEGIN SELECT 1; END')
+        self.assertRaises(ImproperlyConfigured,
+                          SyncNoteIdx.install_sync_triggers)
+        self.assertFalse(SyncNoteIdx.sync_triggers_installed())
+
+        # Removal does not touch the foreign trigger.
+        self.assertEqual(SyncNoteIdx.remove_sync_triggers(), [])
+        self.assertEqual([r[0] for r in self.trigger_rows()],
+                         ['sync_note_idx_ai'])
+        self.database.execute_sql('DROP TRIGGER "sync_note_idx_ai"')
+
+        # A same-named non-trigger object is also a conflict.
+        self.database.execute_sql(
+            'CREATE TABLE "sync_note_idx_ad" (data TEXT)')
+        self.assertRaises(ImproperlyConfigured,
+                          SyncNoteIdx.install_sync_triggers)
+        self.database.execute_sql('DROP TABLE "sync_note_idx_ad"')
+
+    def test_insert_delete_update(self):
+        SyncNoteIdx.install_sync_triggers()
+        n1 = SyncNote.create(title='alpha one', body='first note')
+        n2 = SyncNote.create(title='beta two', body='second note')
+        n3 = SyncNote.create(title='gamma three', body='third alpha')
+        self.assertEqual(self.match_set('alpha'), [n1.id, n3.id])
+        self.assertIndexInSync('alpha', 'beta', 'note')
+
+        SyncNote.delete_by_id(n2.id)
+        self.assertEqual(self.match_set('beta'), [])
+        self.assertIndexInSync('alpha', 'beta', 'note')
+
+        (SyncNote
+         .update(title='beta renamed', body='rewritten')
+         .where(SyncNote.id == n3.id)
+         .execute())
+        self.assertEqual(self.match_set('renamed'), [n3.id])
+        self.assertEqual(self.match_set('gamma'), [])
+        self.assertIndexInSync('alpha', 'renamed', 'gamma', 'rewritten')
+
+    def test_insert_or_replace(self):
+        SyncNoteIdx.install_sync_triggers()
+        SyncNote.create(id=1, title='alpha', body='first')
+        SyncNote.create(id=2, title='beta', body='second')
+
+        # REPLACE deletes the old row; with recursive_triggers enabled the
+        # delete trigger keeps the index consistent.
+        SyncNote.replace(id=1, title='replaced', body='1st').execute()
+        self.assertEqual(self.match_set('alpha'), [])
+        self.assertEqual(self.match_set('replaced'), [1])
+        self.assertIndexInSync('alpha', 'replaced', 'beta')
+
+        (SyncNote
+         .insert(id=2, title='swapped', body='2nd')
+         .on_conflict('replace')
+         .execute())
+        self.assertEqual(self.match_set('beta'), [])
+        self.assertEqual(self.match_set('swapped'), [2])
+        self.assertIndexInSync('beta', 'swapped', 'replaced')
+
+    def test_update_primary_key(self):
+        SyncNoteIdx.install_sync_triggers()
+        SyncNote.create(id=1, title='alpha', body='first')
+        SyncNote.create(id=2, title='beta', body='second')
+
+        # The update trigger removes the old rowid and indexes the new one.
+        SyncNote.update(id=10).where(SyncNote.id == 1).execute()
+        self.assertEqual(self.match_set('alpha'), [10])
+        self.assertIndexInSync('alpha', 'beta')
+
+        SyncNote.delete_by_id(10)
+        self.assertEqual(self.match_set('alpha'), [])
+        self.assertIndexInSync('alpha', 'beta')
+
+    def test_bind_other_database(self):
+        other_db = get_in_memory_db()
+        self.addCleanup(other_db.close)
+        with other_db.bind_ctx([SyncNote, SyncNoteIdx]):
+            other_db.create_tables([SyncNote, SyncNoteIdx])
+            SyncNoteIdx.install_sync_triggers()
+
+            # Trigger names, quoting and identity are derived from the
+            # currently-bound database and model metadata.
+            rows = self.trigger_rows(other_db)
+            self.assertEqual(
+                [r[0] for r in rows],
+                ['sync_note_idx_ad', 'sync_note_idx_ai', 'sync_note_idx_au'])
+            self.assertEqual(set(r[1] for r in rows), {'sync_note'})
+            self.assertIn('ON "sync_note"', rows[0][2])
+            self.assertTrue(SyncNoteIdx.sync_triggers_installed())
+
+            SyncNote.create(title='alpha', body='first')
+            SyncNote.replace(id=1, title='replaced', body='1st').execute()
+            query = SyncNoteIdx.select().where(SyncNoteIdx.match('replaced'))
+            self.assertEqual([r.rowid for r in query], [1])
+            SyncNoteIdx.integrity_check(rank=1)
+
+            self.assertEqual(len(SyncNoteIdx.remove_sync_triggers()), 3)
+            self.assertEqual(self.trigger_rows(other_db), [])
+
+        # Nothing was installed on the original database.
+        self.assertFalse(SyncNoteIdx.sync_triggers_installed())
+        self.assertEqual(self.trigger_rows(), [])
 
 
 class TestRowIDField(ModelTestCase):

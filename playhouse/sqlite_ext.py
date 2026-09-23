@@ -9,6 +9,7 @@ from peewee import Expression
 from peewee import Node
 from peewee import NodeList
 from peewee import OP
+from peewee import is_model
 from peewee import merge_dict
 from peewee import sqlite3
 from playhouse import fts_parser as _fts_parser
@@ -591,7 +592,8 @@ class FTS5Model(BaseFTSModel):
 
     External content tables:
 
-    You can set up triggers to sync these, e.g.
+    You can set up triggers to sync these automatically with
+    install_sync_triggers(), or write them by hand, e.g.
 
     -- Create a table. And an external content fts5 table to index it.
     CREATE TABLE tbl(a INTEGER PRIMARY KEY, b);
@@ -611,7 +613,8 @@ class FTS5Model(BaseFTSModel):
 
     Note: with sqlite's default recursive_triggers=off, INSERT OR REPLACE on
     the content table skips the delete trigger and corrupts the index. Enable
-    PRAGMA recursive_triggers if REPLACE may be used.
+    PRAGMA recursive_triggers if REPLACE may be used (install_sync_triggers
+    enables it).
 
     Built-in auxiliary functions:
 
@@ -851,6 +854,213 @@ class FTS5Model(BaseFTSModel):
     @classmethod
     def integrity_check(cls, rank=0):
         return cls._fts_cmd('integrity-check', rank=rank)
+
+    @classmethod
+    def _quote_identifier(cls, name):
+        ctx = cls._schema._create_context()
+        return ctx.sql(Entity(name)).query()[0]
+
+    @classmethod
+    def _resolve_sync_trigger_args(cls, content_model, rowid, fields):
+        meta = cls._meta
+        options = meta.options or {}
+
+        if content_model is None:
+            content_model = options.get('content')
+        if not is_model(content_model):
+            raise ImproperlyConfigured(
+                'sync triggers require a content model: pass content_model '
+                'or set the "content" option to a Model class.')
+
+        if rowid is None:
+            rowid = options.get('content_rowid')
+        if rowid is None:
+            rowid = content_model._meta.primary_key
+        if isinstance(rowid, Field):
+            rowid_column = rowid.column_name
+        elif isinstance(rowid, str):
+            rowid_column = rowid
+        else:
+            raise ImproperlyConfigured(
+                'rowid must be a Field or a column-name string.')
+
+        search_fields = [f for f in meta.sorted_fields
+                         if isinstance(f, SearchField)]
+        if fields is None:
+            fields = search_fields
+        else:
+            resolved = []
+            for field in fields:
+                if isinstance(field, str):
+                    field = meta.fields.get(field)
+                if (not isinstance(field, SearchField) or
+                        field.model is not cls):
+                    raise ImproperlyConfigured(
+                        'fields must be SearchField objects (or names) '
+                        'belonging to %s.' % cls.__name__)
+                resolved.append(field)
+            fields = resolved
+
+        # The "delete" command needs every indexed column, so the triggers
+        # cannot be declared for a subset that omits one.
+        missing = [f.name for f in search_fields
+                   if not f.unindexed
+                   and not any(f is field for field in fields)]
+        if missing:
+            raise ImproperlyConfigured(
+                'sync triggers must cover all indexed column(s): %s'
+                % ', '.join(missing))
+
+        # SQLite maps the content table by column name, so each indexed
+        # column must exist on the content model.
+        content_columns = set(f.column_name
+                              for f in content_model._meta.sorted_fields)
+        for field in fields:
+            if field.column_name not in content_columns:
+                raise ImproperlyConfigured(
+                    'content model %s has no column named "%s".'
+                    % (content_model.__name__, field.column_name))
+
+        return content_model, rowid_column, fields
+
+    @classmethod
+    def sync_triggers_sql(cls, content_model=None, rowid=None, fields=None):
+        """
+        Generate the INSERT/DELETE/UPDATE triggers that keep this external
+        content FTS5 table in sync with its content model. Returns a dict
+        mapping trigger name to its CREATE TRIGGER statement.
+        """
+        content_model, rowid_column, fields = cls._resolve_sync_trigger_args(
+            content_model, rowid, fields)
+
+        quote = cls._quote_identifier
+        fts_table = quote(cls._meta.table_name)
+        content_table = quote(content_model._meta.table_name)
+        columns = [quote('rowid')]
+        columns.extend(quote(f.column_name) for f in fields)
+        column_list = ', '.join(columns)
+        new_rowid = 'new.%s' % quote(rowid_column)
+        old_rowid = 'old.%s' % quote(rowid_column)
+        new_values = ', '.join([new_rowid] +
+                               ['new.%s' % quote(f.column_name)
+                                for f in fields])
+        old_values = ', '.join([old_rowid] +
+                               ['old.%s' % quote(f.column_name)
+                                for f in fields])
+
+        insert = 'INSERT INTO %s(%s) VALUES (%s);' % (
+            fts_table, column_list, new_values)
+        delete = "INSERT INTO %s(%s, %s) VALUES('delete', %s);" % (
+            fts_table, fts_table, column_list, old_values)
+
+        base = cls._meta.table_name
+        triggers = (
+            ('%s_ai' % base, 'AFTER INSERT', (insert,)),
+            ('%s_ad' % base, 'AFTER DELETE', (delete,)),
+            ('%s_au' % base, 'AFTER UPDATE', (delete, insert)),
+        )
+        accum = {}
+        for name, event, statements in triggers:
+            body = '\n  '.join(statements)
+            accum[name] = ('CREATE TRIGGER %s %s ON %s BEGIN\n  %s\nEND'
+                           % (quote(name), event, content_table, body))
+        return accum
+
+    @staticmethod
+    def _normalize_trigger_sql(sql):
+        # sqlite_master stores the CREATE TRIGGER text verbatim, so
+        # definitions are compared with whitespace collapsed.
+        return ' '.join(sql.split()).rstrip(';')
+
+    @classmethod
+    def _get_named_object(cls, name):
+        cursor = cls._meta.database.execute_sql(
+            'SELECT type, sql FROM sqlite_master WHERE name = ?', (name,))
+        return cursor.fetchone()
+
+    @classmethod
+    def install_sync_triggers(cls, content_model=None, rowid=None,
+                              fields=None):
+        """
+        Create the sync triggers for this external content table. Existing
+        triggers with identical definitions are left in place, so repeated
+        installs do not create a second set. A same-named object with a
+        different definition raises ImproperlyConfigured.
+
+        Also enables the recursive_triggers pragma (persisted on the
+        database), without which INSERT OR REPLACE skips the delete
+        trigger and corrupts the index.
+        """
+        database = cls._meta.database
+        triggers = cls.sync_triggers_sql(content_model, rowid, fields)
+
+        if hasattr(database, 'pragma'):
+            database.pragma('recursive_triggers', 1, permanent=True)
+        else:
+            database.execute_sql('PRAGMA recursive_triggers = ON')
+
+        for name, sql in triggers.items():
+            existing = cls._get_named_object(name)
+            if existing is not None:
+                obj_type, obj_sql = existing
+                if (obj_type == 'trigger' and obj_sql is not None and
+                        cls._normalize_trigger_sql(obj_sql) ==
+                        cls._normalize_trigger_sql(sql)):
+                    continue
+                raise ImproperlyConfigured(
+                    'cannot install sync trigger "%s": a %s with that name '
+                    'already exists with a different definition.'
+                    % (name, obj_type))
+            database.execute_sql(sql)
+
+    @classmethod
+    def sync_triggers_installed(cls, content_model=None, rowid=None,
+                                fields=None):
+        """
+        Check that all three sync triggers exist with the definitions this
+        model would generate.
+        """
+        triggers = cls.sync_triggers_sql(content_model, rowid, fields)
+        for name, sql in triggers.items():
+            existing = cls._get_named_object(name)
+            if (existing is None or existing[0] != 'trigger' or
+                    existing[1] is None or
+                    cls._normalize_trigger_sql(existing[1]) !=
+                    cls._normalize_trigger_sql(sql)):
+                return False
+        return True
+
+    @classmethod
+    def remove_sync_triggers(cls, content_model=None, rowid=None,
+                             fields=None):
+        """
+        Drop the sync triggers previously installed by this model. Triggers
+        whose definitions do not match (e.g. created by the application)
+        are left untouched, as is the content table. Returns the list of
+        dropped trigger names.
+        """
+        database = cls._meta.database
+        triggers = cls.sync_triggers_sql(content_model, rowid, fields)
+        dropped = []
+        for name, sql in triggers.items():
+            existing = cls._get_named_object(name)
+            if (existing is not None and existing[0] == 'trigger' and
+                    existing[1] is not None and
+                    cls._normalize_trigger_sql(existing[1]) ==
+                    cls._normalize_trigger_sql(sql)):
+                database.execute_sql(
+                    'DROP TRIGGER %s' % cls._quote_identifier(name))
+                dropped.append(name)
+        return dropped
+
+    @classmethod
+    def rebuild_index(cls):
+        """
+        Rebuild the index from the content table within a single
+        transaction.
+        """
+        with cls._meta.database.atomic():
+            cls._fts_cmd('rebuild')
 
     @classmethod
     def VocabModel(cls, table_type='row', table=None):

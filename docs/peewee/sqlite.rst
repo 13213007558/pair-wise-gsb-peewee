@@ -1763,13 +1763,49 @@ on the content table, which perform them at exactly the right time:
      INSERT INTO blogindex(rowid, content) VALUES (new.id, new.content);
    END;
 
+Rather than maintaining these statements by hand, the index model can
+declare and manage them. Given the content model, the rowid source and the
+indexed fields (all of which default to the ``content`` /
+``content_rowid`` options and the model's search fields), peewee generates
+the three triggers:
+
+.. code-block:: python
+
+   # Create the blog_ai / blog_ad / blog_au equivalents, named after the
+   # index table: blogindex_ai, blogindex_ad, blogindex_au.
+   BlogIndex.install_sync_triggers()
+
+   # Equivalent explicit form:
+   BlogIndex.install_sync_triggers(Blog, Blog.id, [BlogIndex.content])
+
+   # Inspect the generated statements without executing them:
+   BlogIndex.sync_triggers_sql()  # {trigger_name: CREATE TRIGGER sql, ...}
+
+   # Verify all three triggers exist with the expected definitions:
+   BlogIndex.sync_triggers_installed()  # -> bool
+
+   # Drop only the triggers this model owns (application-defined triggers
+   # and the content table are never touched):
+   BlogIndex.remove_sync_triggers()  # -> list of dropped trigger names
+
+   # Rebuild the index from the content table in a single transaction,
+   # e.g. after bulk-loading existing data:
+   BlogIndex.rebuild_index()
+
+Installing is idempotent: triggers that already exist with identical
+definitions are left in place, so a repeated install never creates a second
+set. If a different object (trigger, table, ...) already uses one of the
+trigger names, ``ImproperlyConfigured`` is raised instead of silently
+replacing it.
+
 .. warning::
    With SQLite's default ``recursive_triggers=off``, ``INSERT OR REPLACE``
    will not fire the delete trigger, which leaves stale rows in the index. If
    the content table is written using :meth:`Model.replace`,
    :meth:`Model.replace_many` or ``on_conflict('replace')``, enable the pragma
    on the database: ``SqliteDatabase('app.db', pragmas={'recursive_triggers':
-   1})``.
+   1})``. :meth:`~FTS5Model.install_sync_triggers` enables it automatically
+   (persisting it on the database for future connections).
 
 To check whether an index has drifted out of sync with its content table, use
 :meth:`~FTS5Model.integrity_check` with ``rank=1``. The default ``rank=0``
@@ -2638,4 +2674,3 @@ Available functions
    SequenceMatcher's algorithm.
 
    .. note:: Only available if you compiled the ``_sqlite_udf`` extension.
-
