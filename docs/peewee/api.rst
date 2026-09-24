@@ -6609,6 +6609,9 @@ Queries
         to eagerly fetch. Each element may also be a ``(query, target_model)``
         tuple: the ``target_model`` names which previously-listed model
         should be joined through when more than one candidate exists.
+        Alternatively, every element may be a :class:`Load` node, giving
+        each relation path its own query (ordering) and ``per_parent``
+        limit; ``Load`` nodes cannot be mixed with plain subqueries.
    :param prefetch_type: Query type to use for the subqueries.
    :return: a list of models with selected relations prefetched. When called
        with no subqueries returns ``sq`` unmodified.

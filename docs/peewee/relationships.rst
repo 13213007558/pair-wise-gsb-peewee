@@ -1119,7 +1119,8 @@ Because it is a real query it can join other tables and select from them:
 
 A relation can limit the rows fetched per parent with ``per_parent=n``: it keeps
 the first ``n`` of each parent's children using a window function, ranked by the
-relation query's ``order_by``:
+relation query's ``order_by``. Ties in the ordering are broken by primary key,
+so which rows make the cut never depends on backend row order:
 
 .. code-block:: python
 
@@ -1137,8 +1138,8 @@ relation query's ``order_by``:
    # carol []
 
 A plain ``query.limit(n)`` instead applies one ``LIMIT`` to the whole relation,
-returning ``n`` rows in total (the same as :func:`prefetch`). Per-parent limits
-require window-function support (SQLite 3.25+, PostgreSQL, MySQL 8).
+returning ``n`` rows in total. Per-parent limits require window-function
+support (SQLite 3.25+, PostgreSQL, MySQL 8).
 
 .. _prefetch-strategy:
 
@@ -1276,6 +1277,45 @@ and other modifiers independently:
 The filter on ``Tweet`` applies only to the prefetched tweets, it does not
 affect which users are returned. ``prefetch`` accepts the ``WHERE`` and ``JOIN``
 strategies through its ``prefetch_type`` keyword (see :ref:`prefetch-strategy`).
+
+Per-path ordering and per-parent limits
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A plain subquery's ``limit(n)`` applies one ``LIMIT`` to the whole relation,
+so ``prefetch(users, tweets.limit(3))`` fetches three tweets *total*, not
+three per user. To give each relation path its own ordering and per-parent
+limit, pass :class:`Load` nodes instead of plain queries (the same objects
+:meth:`~ModelSelect.with_related` accepts):
+
+.. code-block:: python
+
+   # The 3 most-recent tweets for each of the 40 authors, in 2 queries.
+   tweets = Tweet.select().order_by(Tweet.timestamp.desc())
+   users = prefetch(User.select(), Load(User.tweets, tweets, per_parent=3))
+
+   for user in users:
+       print(user.username, [t.content for t in user.tweets])
+
+Each ``Load`` ranks its parent's children with a window function (ordered by
+the relation query's ``order_by``, ties broken by primary key) and keeps the
+first ``per_parent`` rows of each, so the work stays in SQL and the query
+count grows with the number of relations, not the number of parents. Parents
+with no matching rows simply get an empty list. Nest relations with
+:meth:`Load.then` -- each level may use a different limit, and a nested
+relation only loads children of the rows that made the cut:
+
+.. code-block:: python
+
+   spec = Load(User.tweets, tweets, per_parent=3).then(
+       Load(Tweet.favorites, Favorite.select().order_by(Favorite.id.desc()),
+            per_parent=1))
+   users = prefetch(User.select(), spec)  # 3 queries total.
+
+``Load`` nodes cannot be mixed with plain subqueries in one ``prefetch()``
+call, and the ``prefetch_type`` keyword does not apply to them -- set
+``strategy`` on each ``Load`` instead. Unlike plain subqueries, ``Load``
+nodes also support ``PREFETCH_TYPE.MATERIALIZE`` here, because ``prefetch``
+holds the materialized parents.
 
 Choosing between joins and eager loading
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

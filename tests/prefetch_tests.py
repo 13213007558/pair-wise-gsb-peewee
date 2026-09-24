@@ -39,6 +39,7 @@ class Relationship(TestModel):
 class Note(TestModel):
     person = ForeignKeyField(Person, backref='notes')
     content = TextField()
+    timestamp = IntegerField(default=0)
 
 
 class NoteItem(TestModel):
@@ -59,6 +60,18 @@ class Flag(TestModel):
 class Category(TestModel):
     name = TextField()
     parent = ForeignKeyField('self', backref='children', null=True)
+
+
+# FK targeting a non-primary-key field (Team.slug).
+class Team(TestModel):
+    name = TextField()
+    slug = TextField(unique=True)
+
+
+class Member(TestModel):
+    team = ForeignKeyField(Team, field=Team.slug, backref='members')
+    name = TextField()
+    rank = IntegerField(default=0)
 
 
 # ===========================================================================
@@ -749,3 +762,176 @@ class TestPrefetchErrorPaths(ModelTestCase):
         with self.assertRaisesRegex(ValueError, 'MATERIALIZE'):
             prefetch(Person.select(), Note,
                      prefetch_type=PREFETCH_TYPE.MATERIALIZE)
+
+
+# ===========================================================================
+# prefetch() with Load() nodes: per-path ordering and per-parent limits.
+# ===========================================================================
+
+class TestPrefetchLoad(ModelTestCase):
+    requires = [Person, Note, NoteItem, Team, Member]
+
+    def _create_authors(self, count=40, notes_per=5):
+        # The "40 authors, show each one's 3 most-recent posts" page.
+        for i in range(count):
+            author = Person.create(name='author-%02d' % i)
+            for j in range(notes_per):
+                Note.create(person=author, content='a%02d-n%d' % (i, j),
+                            timestamp=j)
+        Person.create(name='empty-author')
+
+    def test_load_per_parent_order_and_limit(self):
+        self._create_authors()
+        notes = Note.select().order_by(Note.timestamp.desc())
+        with self.assertQueryCount(2):
+            people = prefetch(Person.select().order_by(Person.name),
+                              Load(Person.notes, notes, per_parent=3))
+            accum = []
+            for person in people:
+                accum.append((person.name,
+                              [n.timestamp for n in person.notes]))
+                # Children point back at the loaded parent objects.
+                for note in person.notes:
+                    self.assertIs(note.person, person)
+        # Eager: prefetch() returns a list, one query per relation regardless
+        # of the number of parents.
+        self.assertIsInstance(people, list)
+        self.assertEqual(len(accum), 41)
+        for name, timestamps in accum:
+            if name == 'empty-author':
+                self.assertEqual(timestamps, [])
+            else:
+                self.assertEqual(timestamps, [4, 3, 2])
+
+    def test_load_tied_timestamps_deterministic(self):
+        huey = Person.create(name='huey')
+        tied = [Note.create(person=huey, content='n%d' % i, timestamp=7)
+                for i in range(5)]
+        notes = Note.select().order_by(Note.timestamp.desc())
+        with self.assertQueryCount(2):
+            people = prefetch(Person.select(),
+                              Load(Person.notes, notes, per_parent=2))
+            person, = people
+            got = [(n.id, n.content) for n in person.notes]
+        # Ties on timestamp break by primary key ascending, so the cut is
+        # deterministic: exactly the two oldest of the tied notes.
+        self.assertEqual(got, [(tied[0].id, 'n0'), (tied[1].id, 'n1')])
+        # The limit is applied in SQL (window function), not by trimming
+        # rows in Python.
+        sql, params = self.history[-1].msg
+        self.assertTrue('ROW_NUMBER()' in sql)
+        self.assertTrue('"t1"."id" ASC' in sql)
+
+    def test_load_two_levels_different_limits(self):
+        huey = Person.create(name='huey')
+        mickey = Person.create(name='mickey')
+        for person, count in ((huey, 4), (mickey, 3)):
+            for i in range(count):
+                note = Note.create(person=person,
+                                   content='%s-n%d' % (person.name, i),
+                                   timestamp=i)
+                for j in range(3):
+                    NoteItem.create(note=note,
+                                    content='%s-i%d' % (note.content, j))
+        # Top-2 notes per person, then top-1 item per note.
+        spec = Load(Person.notes,
+                    Note.select().order_by(Note.timestamp.desc()),
+                    per_parent=2).then(
+            Load(Note.items,
+                 NoteItem.select().order_by(NoteItem.id.desc()),
+                 per_parent=1))
+        with self.assertQueryCount(3):
+            people = prefetch(Person.select().order_by(Person.name), spec)
+            accum = {}
+            for person in people:
+                notes = {}
+                for note in person.notes:
+                    self.assertIs(note.person, person)
+                    notes[note.content] = [item.content
+                                           for item in note.items]
+                    for item in note.items:
+                        self.assertIs(item.note, note)
+                accum[person.name] = notes
+        # Grandchildren belong only to the notes that made the top-2 cut;
+        # the older notes (and their items) are never fetched.
+        self.assertEqual(accum, {
+            'huey': {'huey-n3': ['huey-n3-i2'],
+                     'huey-n2': ['huey-n2-i2']},
+            'mickey': {'mickey-n2': ['mickey-n2-i2'],
+                       'mickey-n1': ['mickey-n1-i2']}})
+
+    def test_load_empty_parents_return_empty(self):
+        Person.create(name='lonely')
+        with self.assertQueryCount(2):
+            people = prefetch(Person.select(),
+                              Load(Person.notes, Note.select(), per_parent=3))
+            person, = people
+            self.assertEqual(person.notes, [])
+
+    def test_load_fk_to_non_pk_field(self):
+        red = Team.create(name='red', slug='red-slug')
+        blue = Team.create(name='blue', slug='blue-slug')
+        Team.create(name='empty', slug='empty-slug')
+        for team, ranks in ((red, (3, 1, 2)), (blue, (5, 4))):
+            for rank in ranks:
+                Member.create(team=team, name='%s-%d' % (team.name, rank),
+                              rank=rank)
+        members = Member.select().order_by(Member.rank.desc())
+        with self.assertQueryCount(2):
+            teams = prefetch(Team.select().order_by(Team.name),
+                             Load(Team.members, members, per_parent=1))
+            accum = [(team.name, [(m.name, m.rank) for m in team.members])
+                     for team in teams]
+        self.assertEqual(accum, [
+            ('blue', [('blue-5', 5)]),
+            ('empty', []),
+            ('red', [('red-3', 3)])])
+
+    def test_load_model_alias_parent(self):
+        huey = Person.create(name='huey')
+        for i in range(3):
+            Note.create(person=huey, content='n%d' % i, timestamp=i)
+        PA = Person.alias('pa')
+        notes = Note.select().order_by(Note.timestamp.desc())
+        with self.assertQueryCount(2):
+            people = prefetch(PA.select(),
+                              Load(Person.notes, notes, per_parent=2))
+            person, = people
+            got = [n.content for n in person.notes]
+        self.assertEqual(got, ['n2', 'n1'])
+
+    def test_load_materialize_strategy(self):
+        # prefetch() holds the materialized parents, so the MATERIALIZE
+        # strategy (literal IN-list, no parent subquery) works here.
+        huey = Person.create(name='huey')
+        for i in range(4):
+            Note.create(person=huey, content='n%d' % i, timestamp=i)
+        notes = Note.select().order_by(Note.timestamp.desc())
+        with self.assertQueryCount(2):
+            people = prefetch(
+                Person.select(),
+                Load(Person.notes, notes,
+                     strategy=PREFETCH_TYPE.MATERIALIZE, per_parent=2))
+            person, = people
+            got = [n.content for n in person.notes]
+        self.assertEqual(got, ['n3', 'n2'])
+
+    def test_load_via_query_method(self):
+        huey = Person.create(name='huey')
+        Note.create(person=huey, content='n0')
+        with self.assertQueryCount(2):
+            people = (Person
+                      .select()
+                      .prefetch(Load(Person.notes, per_parent=3)))
+            person, = people
+            self.assertEqual([n.content for n in person.notes], ['n0'])
+
+    def test_load_mixed_with_plain_queries_rejected(self):
+        with self.assertRaisesCtx(ValueError):
+            prefetch(Person.select(), Note.select(),
+                     Load(Person.notes, per_parent=1))
+
+    def test_load_prefetch_type_kwarg_rejected(self):
+        with self.assertRaisesCtx(ValueError):
+            prefetch(Person.select(), Load(Person.notes, per_parent=1),
+                     prefetch_type=PREFETCH_TYPE.JOIN)

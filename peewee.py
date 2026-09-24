@@ -9467,6 +9467,25 @@ def prefetch(sq, *subqueries, **kwargs):
     prefetch_type = kwargs.pop('prefetch_type', PREFETCH_TYPE.WHERE)
     if kwargs:
         raise ValueError('Unrecognized arguments: %s' % kwargs)
+    if any(isinstance(subquery, Load) for subquery in subqueries):
+        if not all(isinstance(subquery, Load) for subquery in subqueries):
+            raise ValueError('Load() nodes cannot be mixed with plain '
+                             'queries in a single prefetch() call.')
+        if prefetch_type != PREFETCH_TYPE.WHERE:
+            raise ValueError('prefetch_type is not used with Load() nodes; '
+                             'set the strategy on each Load() instead.')
+        if isinstance(sq, BaseModelSelect) and not sq._model_rows():
+            raise ValueError('prefetch() with Load() requires a query that '
+                             'returns model instances, not dicts/tuples.')
+        # Each Load() carries its own query (ordering) and per_parent limit;
+        # run the tree top-down, one query per relation, against the
+        # database the parent query is bound to.
+        parents = list(sq)
+        database = getattr(sq, '_database', None)
+        if database is None:
+            database = sq.model._meta.database
+        _load_related(parents, sq, subqueries, database=database)
+        return parents
     if prefetch_type == PREFETCH_TYPE.MATERIALIZE:
         raise ValueError('PREFETCH_TYPE.MATERIALIZE is not supported by '
                          'prefetch(). Use Model.select().with_related() with '
@@ -9637,6 +9656,15 @@ class Load(Node):
         pks = rel_model._meta.get_primary_keys()
         order = [self._rank_term(o, pks, field)
                  for o in (base._order_by or pks)]
+        if base._order_by is not None:
+            # Deterministic tie-break: rank ties by primary key so the top-N
+            # cut never depends on backend row order.
+            ranked = []
+            for o in base._order_by:
+                term = o if isinstance(o, Ordering) else Asc(o)
+                ranked.append(term.node.unwrap())
+            order.extend(pk.asc() for pk in pks
+                         if not any(node is pk for node in ranked))
         rn = (fn.ROW_NUMBER()
               .over(partition_by=[field], order_by=order)
               .alias('_rn'))

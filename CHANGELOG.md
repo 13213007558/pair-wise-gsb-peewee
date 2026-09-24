@@ -9,6 +9,13 @@ https://github.com/coleifer/peewee/releases
 
 [View commits](https://github.com/coleifer/peewee/compare/4.5.1...master)
 
+* `prefetch()` accepts `Load()` nodes (in addition to plain subqueries), so
+  each relation path can specify its own ordering and a per-parent limit
+  (`per_parent=n`, ranked by a window function). `Load()` nodes cannot be
+  mixed with plain subqueries in one call.
+* Per-parent ranking (`Load(..., per_parent=n)`) now breaks ordering ties by
+  primary key, making the top-N cut deterministic.
+
 ## 4.5.1
 
 * `EnumField` and `IntEnumField` validate member value types (`str` and
