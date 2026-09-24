@@ -9474,9 +9474,24 @@ def prefetch(sq, *subqueries, **kwargs):
     elif prefetch_type not in PREFETCH_TYPE.values():
         raise ValueError('prefetch_type must be a PREFETCH_TYPE value.')
 
-    fixed_queries = prefetch_add_subquery(sq, subqueries, prefetch_type)
+    # Load() nodes carry their own ordering, strategy and per-parent limit,
+    # and run against the materialized parents via _load_related(). Anything
+    # else goes through the flat fk-chaining engine as before.
+    loads = []
+    queries = []
+    for subquery in subqueries:
+        if isinstance(subquery, Load):
+            loads.append(subquery)
+        elif isinstance(subquery, (BackrefAccessor, ForeignKeyField,
+                                   FieldAlias)):
+            loads.append(Load(subquery))
+        else:
+            queries.append(subquery)
+
+    fixed_queries = prefetch_add_subquery(sq, queries, prefetch_type)
     deps = {}
     rel_map = {}
+    levels = []
     for pq in reversed(fixed_queries):
         query_model = pq.model
         if pq.fields:
@@ -9488,14 +9503,36 @@ def prefetch(sq, *subqueries, **kwargs):
         id_map = deps[query_model]
         has_relations = bool(rel_map.get(query_model))
 
+        rows = []
         for instance in pq.query:
             if pq.fields:
                 pq.store_instance(instance, id_map)
             if has_relations:
                 for rel in rel_map[query_model]:
                     rel.populate_instance(instance, deps[rel.model])
+            rows.append(instance)
+        levels.append((query_model, rows, pq.query))
 
-    return list(pq.query)
+    if loads:
+        _prefetch_loads(levels, loads)
+    return levels[-1][1]
+
+
+def _prefetch_loads(levels, loads):
+    # Attach each Load() to the deepest fetched level whose model matches the
+    # relation's parent. Levels are ordered deepest-first, so the first match
+    # is the innermost eligible parent query.
+    for load in loads:
+        field = load._field
+        parent_model = field.rel_model if load._is_backref else field.model
+        for model, rows, query in levels:
+            candidate = model.model if isinstance(model, ModelAlias) else model
+            if candidate is parent_model:
+                break
+        else:
+            raise ValueError('Error: unable to find a prefetched level to '
+                             'attach load: %s' % (load,))
+        _load_related(rows, query, [load])
 
 
 def _bucket(field, is_backref, children, parents):
@@ -9635,8 +9672,18 @@ class Load(Node):
             raise ValueError('per_parent is not supported with a grouped or '
                              'aggregate relation query.')
         pks = rel_model._meta.get_primary_keys()
-        order = [self._rank_term(o, pks, field)
-                 for o in (base._order_by or pks)]
+        if base._order_by:
+            order = [self._rank_term(o, pks, field) for o in base._order_by]
+            # Deterministic tie-break: rows comparing equal on the relation's
+            # ordering fall back to primary-key order, so which rows make the
+            # top-N cut never depends on backend row order.
+            ranked = set()
+            for o in base._order_by:
+                node = o.node if isinstance(o, Ordering) else o
+                ranked.add(id(node.unwrap()))
+            order.extend(pk for pk in pks if id(pk) not in ranked)
+        else:
+            order = list(pks)
         rn = (fn.ROW_NUMBER()
               .over(partition_by=[field], order_by=order)
               .alias('_rn'))

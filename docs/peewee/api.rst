@@ -6609,6 +6609,11 @@ Queries
         to eagerly fetch. Each element may also be a ``(query, target_model)``
         tuple: the ``target_model`` names which previously-listed model
         should be joined through when more than one candidate exists.
+        An element may instead be a :class:`Load` node (or a bare
+        foreign-key / back-reference, which is wrapped in one), giving that
+        relation path its own query, ordering and ``per_parent`` limit.
+        ``Load`` nodes attach to the deepest prefetched level matching their
+        parent model and may nest further relations with :meth:`Load.then`.
    :param prefetch_type: Query type to use for the subqueries.
    :return: a list of models with selected relations prefetched. When called
        with no subqueries returns ``sq`` unmodified.
@@ -6657,6 +6662,25 @@ Queries
           for tweet in user.tweets:  # Does not require additional query.
               print('    ', tweet.content)
 
+   Each relation path may carry its own ordering and a per-parent limit by
+   passing a :class:`Load` node. The limit is applied per parent (a window
+   function ranks each parent's rows, with primary-key order breaking ties),
+   not across the whole relation:
+
+   .. code-block:: python
+
+      # The 3 most-recent tweets of each user, in one extra query.
+      tweets = Tweet.select().order_by(Tweet.timestamp.desc())
+      query = prefetch(User.select(), Load(User.tweets, tweets, per_parent=3))
+
+      # Limits compose across levels: top-2 tweets per user, then the single
+      # most-recent favorite of each selected tweet (3 queries total).
+      spec = (Load(User.tweets, tweets, per_parent=2)
+              .then(Load(Tweet.favorites,
+                         Favorite.select().order_by(Favorite.id.desc()),
+                         per_parent=1)))
+      query = prefetch(User.select(), spec)
+
    Because ``prefetch`` must reconstruct a graph of models, it is
    necessary to be sure that the foreign-key/primary-key of any
    related models are selected, so that the related objects can be
@@ -6681,9 +6705,10 @@ Queries
        function. Requires SQLite 3.25+, PostgreSQL or MySQL 8. A plain
        ``query.limit(n)`` instead caps the whole relation at ``n`` rows total.
 
-   A node in the load tree passed to :meth:`ModelSelect.with_related`, describing
-   one relationship. The filtering, ordering and limiting for a relation live on
-   its ``query``. :meth:`Load.then` nests additional relation(s) and may be chained.
+   A node in the load tree passed to :meth:`ModelSelect.with_related` or
+   :func:`prefetch`, describing one relationship. The filtering, ordering and
+   limiting for a relation live on its ``query``. :meth:`Load.then` nests
+   additional relation(s) and may be chained.
 
    .. method:: then(*loads)
 

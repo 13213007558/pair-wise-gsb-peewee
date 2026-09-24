@@ -877,7 +877,7 @@ class TestWithRelatedLimit(ModelTestCase):
         self.assertHistory(1, [
             ('WITH "_load_ranked_0" AS (SELECT "t1"."id", ROW_NUMBER() '
              'OVER (PARTITION BY "t1"."user_id" '
-             'ORDER BY MAX("t1"."timestamp") DESC) AS "_rn" '
+             'ORDER BY MAX("t1"."timestamp") DESC, "t1"."id") AS "_rn" '
              'FROM "tweet" AS "t1" WHERE ("t1"."user_id" IN (?, ?)) '
              'GROUP BY "t1"."id", "t1"."user_id") '
              'SELECT "t2"."id", "t2"."user_id", "t2"."content", '
@@ -948,7 +948,7 @@ class TestWithRelatedLimit(ModelTestCase):
         self.assertHistory(1, [
             ('WITH "_load_ranked_0" AS (SELECT "t1"."id", ROW_NUMBER() '
              'OVER (PARTITION BY "t1"."user_id" '
-             'ORDER BY MAX("t1"."timestamp") DESC) AS "_rn" '
+             'ORDER BY MAX("t1"."timestamp") DESC, "t1"."id") AS "_rn" '
              'FROM "tweet" AS "t1" INNER JOIN "favorite" AS "t2" '
              'ON ("t2"."tweet_id" = "t1"."id") '
              'WHERE ("t1"."user_id" IN (?)) '
@@ -1179,7 +1179,7 @@ class TestWithRelatedLimit(ModelTestCase):
              'AS "_rn" FROM "favorite" AS "t1" WHERE ("t1"."tweet_id" IN '
              '(WITH "_load_ranked_0" AS (SELECT "t2"."id", ROW_NUMBER() '
              'OVER (PARTITION BY "t2"."user_id" '
-             'ORDER BY MAX("t2"."timestamp") DESC) AS "_rn" '
+             'ORDER BY MAX("t2"."timestamp") DESC, "t2"."id") AS "_rn" '
              'FROM "tweet" AS "t2" WHERE ("t2"."user_id" IN '
              '(SELECT "t3"."id" FROM "user" AS "t3" '
              'WHERE ("t3"."username" = ?))) '

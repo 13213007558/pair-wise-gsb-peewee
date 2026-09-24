@@ -749,3 +749,198 @@ class TestPrefetchErrorPaths(ModelTestCase):
         with self.assertRaisesRegex(ValueError, 'MATERIALIZE'):
             prefetch(Person.select(), Note,
                      prefetch_type=PREFETCH_TYPE.MATERIALIZE)
+
+
+# ===========================================================================
+# Per-path ordering and per-parent limits: prefetch() + Load() nodes.
+# ===========================================================================
+
+class Author(TestModel):
+    name = TextField()
+
+
+class Post(TestModel):
+    author = ForeignKeyField(Author, backref='posts')
+    title = TextField()
+    timestamp = IntegerField(default=0)
+
+
+class Comment(TestModel):
+    post = ForeignKeyField(Post, backref='comments')
+    body = TextField()
+    created = IntegerField(default=0)
+
+
+class TestPrefetchLoads(ModelTestCase):
+    requires = [Author, Post, Comment]
+
+    def setUp(self):
+        super(TestPrefetchLoads, self).setUp()
+        # huey's posts tie at ts=2 (h1, h2, h3): primary-key order is the
+        # deterministic tie-break for the top-N cut.
+        data = (
+            ('huey', (('h0', 1), ('h1', 2), ('h2', 2), ('h3', 2), ('h4', 3))),
+            ('mickey', (('m0', 1), ('m1', 2))),
+            ('zaizee', ()))
+        self.authors = {}
+        self.posts = {}
+        with self.database.atomic():
+            for name, posts in data:
+                author = self.authors[name] = Author.create(name=name)
+                for title, ts in posts:
+                    self.posts[title] = Post.create(
+                        author=author, title=title, timestamp=ts)
+
+    def _add_comments(self, *titles):
+        for title in titles:
+            for j in range(3):
+                Comment.create(post=self.posts[title],
+                               body='%s-c%d' % (title, j), created=j)
+
+    def test_load_per_parent_limit_with_ties(self):
+        # Top-3 newest per author: the ts=2 tie is broken by pk order, so
+        # h1 and h2 make the cut and h3 does not.
+        posts = Post.select().order_by(Post.timestamp.desc())
+        with self.assertQueryCount(2):
+            query = prefetch(Author.select().order_by(Author.name),
+                             Load(Author.posts, posts, per_parent=3))
+            got = {a.name: [p.title for p in a.posts] for a in query}
+        self.assertEqual(got, {
+            'huey': ['h4', 'h1', 'h2'],
+            'mickey': ['m1', 'm0'],
+            'zaizee': []})
+
+    def test_load_related_object_identity(self):
+        posts = Post.select().order_by(Post.timestamp.desc())
+        query = prefetch(Author.select(),
+                         Load(Author.posts, posts, per_parent=2))
+        for author in query:
+            for post in author.posts:
+                # The fk points back at the very instance prefetch returned.
+                self.assertIs(post.author, author)
+                self.assertEqual(post.dirty_fields, [])
+
+    def test_load_empty_parent_gets_empty_list(self):
+        with self.assertQueryCount(2):
+            query = prefetch(Author.select().where(Author.name == 'zaizee'),
+                             Load(Author.posts, per_parent=2))
+            zaizee, = query
+        self.assertEqual(zaizee.posts, [])
+
+    def test_load_two_levels_different_limits(self):
+        # Top-2 posts per author, then top-1 comment per post. Comments on
+        # posts that did not make the cut are never loaded.
+        self._add_comments('h1', 'h2', 'h3', 'h4', 'm0', 'm1')
+        spec = (Load(Author.posts,
+                     Post.select().order_by(Post.timestamp.desc()),
+                     per_parent=2)
+                .then(Load(Post.comments,
+                           Comment.select().order_by(Comment.created.desc()),
+                           per_parent=1)))
+        with self.assertQueryCount(3):
+            query = prefetch(Author.select().order_by(Author.name), spec)
+            accum = {}
+            for author in query:
+                accum[author.name] = {}
+                for post in author.posts:
+                    accum[author.name][post.title] = [
+                        c.body for c in post.comments]
+                    for comment in post.comments:
+                        # Grandchildren hang off the selected post instances.
+                        self.assertIs(comment.post, post)
+        self.assertEqual(accum, {
+            'huey': {'h4': ['h4-c2'], 'h1': ['h1-c2']},
+            'mickey': {'m1': ['m1-c2'], 'm0': ['m0-c2']},
+            'zaizee': {}})
+
+    def test_load_attaches_to_flat_subquery_level(self):
+        # A Load() mixes with ordinary subqueries and binds to the level its
+        # parent model was fetched at.
+        self._add_comments('h0', 'h1', 'm0')
+        comments = Comment.select().order_by(Comment.created.desc())
+        with self.assertQueryCount(3):
+            query = prefetch(Author.select().order_by(Author.name),
+                             Post.select().order_by(Post.title),
+                             Load(Post.comments, comments, per_parent=1))
+            got = {a.name: [(p.title, [c.body for c in p.comments])
+                            for p in a.posts] for a in query}
+        self.assertEqual(got, {
+            'huey': [('h0', ['h0-c2']), ('h1', ['h1-c2']), ('h2', []),
+                     ('h3', []), ('h4', [])],
+            'mickey': [('m0', ['m0-c2']), ('m1', [])],
+            'zaizee': []})
+
+    def test_load_per_parent_model_alias(self):
+        PA = Author.alias('pa')
+        posts = Post.select().order_by(Post.timestamp.desc())
+        with self.assertQueryCount(2):
+            query = prefetch(PA.select().order_by(PA.name),
+                             Load(Author.posts, posts, per_parent=1))
+            got = {a.name: [p.title for p in a.posts] for a in query}
+        self.assertEqual(got, {
+            'huey': ['h4'], 'mickey': ['m1'], 'zaizee': []})
+
+    def test_load_per_parent_paginated_parent(self):
+        # The parent LIMIT/OFFSET is wrapped as a derived table inside the
+        # ranking CTE, so only the page's authors drive the top-N.
+        posts = Post.select().order_by(Post.timestamp.desc())
+        with self.assertQueryCount(2):
+            query = prefetch(
+                Author.select().order_by(Author.name).paginate(2, 1),
+                Load(Author.posts, posts, per_parent=1))
+            got = {a.name: [p.title for p in a.posts] for a in query}
+        self.assertEqual(got, {'mickey': ['m1']})
+
+    def test_load_materialize_strategy(self):
+        # prefetch() holds the parents in memory, so a Load() may use the
+        # MATERIALIZE strategy even though prefetch_type= may not.
+        posts = Post.select().order_by(Post.timestamp.desc())
+        with self.assertQueryCount(2):
+            query = prefetch(
+                Author.select().order_by(Author.name),
+                Load(Author.posts, posts,
+                     strategy=PREFETCH_TYPE.MATERIALIZE, per_parent=1))
+            got = {a.name: [p.title for p in a.posts] for a in query}
+        self.assertEqual(got, {
+            'huey': ['h4'], 'mickey': ['m1'], 'zaizee': []})
+
+    def test_bare_backref_and_fk_specs(self):
+        # A bare backref or fk field is wrapped in Load() automatically.
+        with self.assertQueryCount(2):
+            query = prefetch(Author.select().order_by(Author.name),
+                             Author.posts)
+            got = {a.name: sorted(p.title for p in a.posts) for a in query}
+        self.assertEqual(got, {
+            'huey': ['h0', 'h1', 'h2', 'h3', 'h4'],
+            'mickey': ['m0', 'm1'],
+            'zaizee': []})
+
+        with self.assertQueryCount(2):
+            posts = prefetch(Post.select().order_by(Post.title), Post.author)
+            got = [(p.title, p.author.name) for p in posts[:3]]
+        self.assertEqual(got, [('h0', 'huey'), ('h1', 'huey'),
+                               ('h2', 'huey')])
+
+    def test_load_without_matching_level_error(self):
+        # No fetched level has Post as its model to attach comments to.
+        with self.assertRaises(ValueError):
+            prefetch(Author.select(), Load(Post.comments))
+
+    @requires_models(Package, PackageItem)
+    def test_load_per_parent_non_pk_fk(self):
+        # PackageItem.package targets Package.barcode, not the pk.
+        data = (('101', ('a', 'b')),
+                ('102', ()),
+                ('104', ('a', 'b', 'c', 'd')))
+        for barcode, items in data:
+            Package.create(barcode=barcode)
+            for name in items:
+                PackageItem.create(package=barcode, name=name)
+
+        items = PackageItem.select().order_by(PackageItem.name)
+        with self.assertQueryCount(2):
+            query = prefetch(Package.select().order_by(Package.barcode),
+                             Load(Package.items, items, per_parent=2))
+            got = {p.barcode: [i.name for i in p.items] for p in query}
+        self.assertEqual(got, {
+            '101': ['a', 'b'], '102': [], '104': ['a', 'b']})

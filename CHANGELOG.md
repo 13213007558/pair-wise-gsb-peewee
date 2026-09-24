@@ -7,6 +7,11 @@ https://github.com/coleifer/peewee/releases
 
 ## master
 
+* `prefetch()` accepts `Load` nodes (and bare fk/backref specs), so each
+  relation path can carry its own query, ordering and `per_parent` top-N
+  limit. Per-parent ranking now breaks ties by primary key, making the
+  top-N cut deterministic.
+
 [View commits](https://github.com/coleifer/peewee/compare/4.5.1...master)
 
 ## 4.5.1
