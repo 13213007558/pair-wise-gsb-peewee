@@ -88,6 +88,7 @@ __all__ = [
     'Check',
     'chunked',
     'Column',
+    'CompositeForeignKey',
     'CompositeKey',
     'Context',
     'Database',
@@ -5616,6 +5617,111 @@ class BackrefAccessor(object):
         return self
 
 
+class CompositeForeignKeyAccessor(object):
+    def __init__(self, model, field, name):
+        self.model = model
+        self.field = field
+        self.name = name
+        self.rel_model = field.rel_model
+
+    def _get_key(self, instance):
+        return tuple(instance.__data__.get(local.name)
+                     for local in self.field.local_fields)
+
+    def __get__(self, instance, instance_type=None):
+        if instance is None:
+            return self.field
+        field = self.field
+        key = self._get_key(instance)
+        if self.name in instance.__rel__:
+            cached = instance.__rel__[self.name]
+            if cached is None:
+                # None marks a verified-absent relation (e.g. outer join).
+                return None
+            if field.rel_key(cached) == key:
+                return cached
+            # The local values changed underneath the cached object.
+            del instance.__rel__[self.name]
+        if None in key:
+            # Incomplete composite key: never issue a query that filters on
+            # just a subset of the columns.
+            if not field.null and field.lazy_load:
+                raise self.rel_model.DoesNotExist
+            return None
+        if not field.lazy_load:
+            return key
+        expr = reduce(operator.and_, [
+            rel == value
+            for rel, value in zip(field.rel_fields, key)])
+        obj = self.rel_model.get(expr)
+        instance.__rel__[self.name] = obj
+        return obj
+
+    def __set__(self, instance, obj):
+        field = self.field
+        nfields = len(field.local_fields)
+        if obj is None:
+            values = (None,) * nfields
+            rel_obj = None
+        elif isinstance(obj, field.rel_model):
+            rel_obj = obj
+            values = tuple(getattr(obj, rel.name) for rel in field.rel_fields)
+        elif isinstance(obj, (tuple, list)):
+            rel_obj = None
+            values = tuple(obj)
+            if len(values) != nfields:
+                raise ValueError('Composite foreign-key "%s" expects %d '
+                                 'values, got %d.' %
+                                 (self.name, nfields, len(values)))
+        else:
+            raise ValueError('Composite foreign-key "%s" must be assigned a '
+                             '%s instance, a sequence of %d values, or None.' %
+                             (self.name, field.rel_model.__name__, nfields))
+
+        n_nulls = values.count(None)
+        if n_nulls == nfields:
+            if not field.null:
+                raise ValueError('Composite foreign-key "%s" is not nullable.'
+                                 % self.name)
+            instance.__rel__.pop(self.name, None)
+        elif n_nulls:
+            raise ValueError('Composite foreign-key "%s" cannot be partially '
+                             'null: either every component or none of them '
+                             'must be None.' % self.name)
+        elif rel_obj is not None:
+            instance.__rel__[self.name] = rel_obj
+        elif self.name in instance.__rel__:
+            cached = instance.__rel__[self.name]
+            if cached is None or field.rel_key(cached) != values:
+                del instance.__rel__[self.name]
+
+        for local, value in zip(field.local_fields, values):
+            instance.__data__[local.name] = value
+            instance._dirty.add(local.name)
+
+
+class CompositeBackrefAccessor(object):
+    def __init__(self, field):
+        self.field = field
+        self.model = field.rel_model
+        self.rel_model = field.model
+
+    def __get__(self, instance, instance_type=None):
+        if instance is not None:
+            field = self.field
+            key = tuple(getattr(instance, rel.name)
+                        for rel in field.rel_fields)
+            if None in key:
+                # Incomplete key: match nothing rather than querying on a
+                # subset of the columns.
+                return self.rel_model.select().where(SQL('0 = 1'))
+            expr = reduce(operator.and_, [
+                local == value
+                for local, value in zip(field.local_fields, key)])
+            return self.rel_model.select().where(expr)
+        return self
+
+
 class ObjectIdAccessor(object):
     def __init__(self, field):
         self.field = field
@@ -6698,6 +6804,36 @@ class ForeignKeyField(Field):
     def adapt(self, value):
         return self.rel_field.adapt(value)
 
+    def get_local_fields(self):
+        return (self,)
+
+    def get_rel_fields(self):
+        return (self.rel_field,)
+
+    def holder_key(self, instance, convert=False):
+        # Key identifying the relation, read from the fk-holding instance.
+        value = instance.__data__[self.name]
+        return self.rel_field.python_value(value) if convert else value
+
+    def rel_key(self, instance, convert=False):
+        # Key identifying the relation, read from the referenced instance.
+        value = instance.__data__[self.rel_field.name]
+        return self.rel_field.python_value(value) if convert else value
+
+    def null_assignments(self):
+        return {self.name: None}
+
+    def join_columns(self, holder, referenced):
+        # Pairs of (column on the fk-holding side, column it references).
+        return [(getattr(holder, self.name),
+                 getattr(referenced, self.rel_field.name))]
+
+    def dependency_expression(self, instance):
+        return self == instance.__data__[self.rel_field.name]
+
+    def dependency_in(self, query):
+        return self << query
+
     def db_value(self, value):
         if isinstance(value, self.rel_model):
             value = getattr(value, self.rel_field.name)
@@ -6827,6 +6963,175 @@ class DeferredThroughModel(object):
 class MetaField(Field):
     column_name = default = model = name = None
     primary_key = False
+
+
+class CompositeForeignKey(MetaField):
+    accessor_class = CompositeForeignKeyAccessor
+    backref_accessor_class = CompositeBackrefAccessor
+    object_id_name = None
+
+    def __init__(self, model, fields, backref=None, on_delete=None,
+                 on_update=None, deferrable=None, lazy_load=True, null=None,
+                 constraint_name=None):
+        self._is_self_reference = isinstance(model, str) and model == 'self'
+        self.rel_model = model
+        self.declared_fields = fields
+        self.declared_backref = backref
+        self.backref = None
+        self.on_delete = on_delete
+        self.on_update = on_update
+        self.deferrable = deferrable
+        self.deferred = False
+        self.lazy_load = lazy_load
+        self.constraint_name = constraint_name
+        self._null = null
+
+    def _normalize_field_pairs(self):
+        pairs = self.declared_fields
+        if isinstance(pairs, dict):
+            pairs = list(pairs.items())
+        normalized = []
+        for pair in pairs:
+            if isinstance(pair, str):
+                normalized.append((pair, pair))
+            else:
+                local, rel = pair
+                normalized.append((local, rel))
+        if len(normalized) < 2:
+            raise ValueError('CompositeForeignKey "%s" requires at least '
+                             'two fields; use ForeignKeyField for a single '
+                             'column.' % self.name)
+        return normalized
+
+    def bind(self, model, name, set_attribute=True):
+        self.model = model
+        self.name = self.safe_name = name
+        if self._is_self_reference:
+            self.rel_model = model
+
+        local_fields = []
+        rel_fields = []
+        for local_name, rel_name in self._normalize_field_pairs():
+            local = model._meta.fields.get(local_name)
+            if local is None:
+                raise ValueError('CompositeForeignKey "%s": local field "%s" '
+                                 'does not exist on %s. Declare it before '
+                                 'the composite foreign-key.'
+                                 % (name, local_name, model.__name__))
+            if isinstance(rel_name, Field):
+                rel = rel_name
+            else:
+                rel = self.rel_model._meta.fields.get(rel_name)
+            if rel is None:
+                raise ValueError('CompositeForeignKey "%s": field "%s" does '
+                                 'not exist on %s.'
+                                 % (name, rel_name,
+                                    self.rel_model.__name__))
+            local_fields.append(local)
+            rel_fields.append(rel)
+        self.local_fields = tuple(local_fields)
+        self.rel_fields = tuple(rel_fields)
+
+        if self._null is not None:
+            self.null = self._null
+        else:
+            # The relation can only be cleared when every local column
+            # accepts NULL.
+            self.null = all(local.null for local in self.local_fields)
+
+        if callable_(self.declared_backref):
+            self.backref = self.declared_backref(self)
+        else:
+            self.backref, self.declared_backref = self.declared_backref, None
+        if not self.backref:
+            self.backref = '%s_set' % model._meta.name
+
+        if set_attribute:
+            setattr(model, name, self.accessor_class(model, self, name))
+            if self.backref not in ('+', '!'):
+                setattr(self.rel_model, self.backref,
+                        self.backref_accessor_class(self))
+
+    def get_local_fields(self):
+        return self.local_fields
+
+    def get_rel_fields(self):
+        return self.rel_fields
+
+    def holder_key(self, instance, convert=False):
+        values = tuple(instance.__data__.get(local.name)
+                       for local in self.local_fields)
+        if convert:
+            values = tuple(rel.python_value(value) for rel, value
+                           in zip(self.rel_fields, values))
+        return values
+
+    def rel_key(self, instance, convert=False):
+        values = tuple(instance.__data__.get(rel.name)
+                       for rel in self.rel_fields)
+        if convert:
+            values = tuple(rel.python_value(value) for rel, value
+                           in zip(self.rel_fields, values))
+        return values
+
+    def null_assignments(self):
+        return dict((local.name, None) for local in self.local_fields)
+
+    def get_constraint_name(self):
+        columns = '_'.join(local.column_name for local in self.local_fields)
+        return self.constraint_name or 'fk_%s_%s_refs_%s' % (
+            self.model._meta.table_name,
+            columns,
+            self.rel_model._meta.table_name)
+
+    def foreign_key_constraint(self, explicit_name=False):
+        parts = []
+        if self.constraint_name or explicit_name:
+            name = self.get_constraint_name()
+            parts.extend([
+                SQL('CONSTRAINT'),
+                Entity(_truncate_constraint_name(name))])
+
+        parts.extend([
+            SQL('FOREIGN KEY'),
+            EnclosedNodeList(self.local_fields),
+            SQL('REFERENCES'),
+            self.rel_model,
+            EnclosedNodeList(self.rel_fields)])
+        if self.on_delete:
+            parts.append(SQL('ON DELETE %s' % self.on_delete))
+        if self.on_update:
+            parts.append(SQL('ON UPDATE %s' % self.on_update))
+        if self.deferrable:
+            parts.append(SQL('DEFERRABLE %s' % self.deferrable))
+        return NodeList(parts)
+
+    def join_columns(self, holder, referenced):
+        # Pairs of (column on the fk-holding side, column it references).
+        return [(getattr(holder, local.name), getattr(referenced, rel.name))
+                for local, rel in zip(self.local_fields, self.rel_fields)]
+
+    def _join_on(self, src, dest, is_backref, src_attr, dest_attr):
+        if is_backref:
+            holder, referenced = dest, src
+            holder_attr, rel_attr = dest_attr, src_attr
+        else:
+            holder, referenced = src, dest
+            holder_attr, rel_attr = src_attr, dest_attr
+        exprs = []
+        for local, rel in zip(self.local_fields, self.rel_fields):
+            lhs = getattr(holder, getattr(local, holder_attr))
+            rhs = getattr(referenced, getattr(rel, rel_attr))
+            exprs.append(lhs == rhs)
+        return reduce(operator.and_, exprs)
+
+    def dependency_expression(self, instance):
+        return reduce(operator.and_, [
+            local == instance.__data__[rel.name]
+            for local, rel in zip(self.local_fields, self.rel_fields)])
+
+    def dependency_in(self, query):
+        return Expression(EnclosedNodeList(self.local_fields), OP.IN, query)
 
 
 class ManyToManyFieldAccessor(FieldAccessor):
@@ -7116,6 +7421,9 @@ class SchemaManager(object):
             if isinstance(field, ForeignKeyField) and not field.deferred:
                 constraints.append(field.foreign_key_constraint())
 
+        for composite_fk in meta.composite_keys.values():
+            constraints.append(composite_fk.foreign_key_constraint())
+
         if meta.constraints:
             constraints.extend(meta.constraints)
 
@@ -7371,6 +7679,7 @@ class Metadata(object):
         self.model_refs = collections.defaultdict(list)
         self.model_backrefs = collections.defaultdict(list)
         self.manytomany = {}
+        self.composite_keys = {}
 
         self.options = options or {}
         for key, value in kwargs.items():
@@ -7506,6 +7815,9 @@ class Metadata(object):
 
         if isinstance(field, ForeignKeyField):
             self.add_ref(field)
+        elif isinstance(field, CompositeForeignKey):
+            self.add_ref(field)
+            self.composite_keys[field.name] = field
         elif isinstance(field, ManyToManyField) and field.name:
             self.add_manytomany(field)
 
@@ -8114,9 +8426,9 @@ class Model(Node, metaclass=ModelBase):
             seen.add(klass)
             for fk, rel_model in klass._meta.backrefs.items():
                 if rel_model is model_class or query is None:
-                    node = (fk == self.__data__[fk.rel_field.name])
+                    node = fk.dependency_expression(self)
                 else:
-                    node = fk << query
+                    node = fk.dependency_in(query)
                 subquery = (rel_model.select(rel_model._meta.primary_key)
                             .where(node))
                 if not fk.null or search_nullable:
@@ -8135,7 +8447,7 @@ class Model(Node, metaclass=ModelBase):
             for query, fk in self.dependencies(exclude_null_children=not delete_nullable):
                 model = fk.model
                 if fk.null and not delete_nullable:
-                    model.update(**{fk.name: None}).where(query).execute()
+                    model.update(**fk.null_assignments()).where(query).execute()
                 else:
                     model.delete().where(query).execute()
         return type(self).delete().where(self._pk_expr()).execute()
@@ -8594,13 +8906,17 @@ class ModelSelect(BaseModelSelect, Select):
             if on is None:
                 src_attr = 'name' if src_is_model else 'column_name'
                 dest_attr = 'name' if dest_is_model else 'column_name'
-                if is_backref:
+                if isinstance(fk_field, CompositeForeignKey):
+                    on = fk_field._join_on(src, dest, is_backref,
+                                           src_attr, dest_attr)
+                elif is_backref:
                     lhs = getattr(dest, getattr(fk_field, dest_attr))
                     rhs = getattr(src, getattr(fk_field.rel_field, src_attr))
+                    on = (lhs == rhs)
                 else:
                     lhs = getattr(src, getattr(fk_field, src_attr))
                     rhs = getattr(dest, getattr(fk_field.rel_field, dest_attr))
-                on = (lhs == rhs)
+                    on = (lhs == rhs)
 
             if not attr:
                 if fk_field is not None and not is_backref:
@@ -8741,7 +9057,8 @@ class ModelSelect(BaseModelSelect, Select):
     def convert_dict_to_node(self, qdict):
         accum = []
         joins = []
-        fks = (ForeignKeyField, BackrefAccessor)
+        fks = (ForeignKeyField, BackrefAccessor, CompositeForeignKey,
+               CompositeBackrefAccessor)
         for key, value in sorted(qdict.items()):
             curr = self.model
             if '__' in key and key.rsplit('__', 1)[1] in DJANGO_MAP:
@@ -8823,6 +9140,12 @@ class ModelSelect(BaseModelSelect, Select):
                 lm, rm = field.model, field.rel_model
                 field_obj = field
             elif isinstance(field, BackrefAccessor):
+                lm, rm = field.model, field.rel_model
+                field_obj = field.field
+            elif isinstance(field, CompositeForeignKey):
+                lm, rm = field.model, field.rel_model
+                field_obj = field
+            elif isinstance(field, CompositeBackrefAccessor):
                 lm, rm = field.model, field.rel_model
                 field_obj = field.field
             query = query.ensure_join(lm, rm, field_obj)
@@ -9176,8 +9499,9 @@ class ModelCursorWrapper(BaseModelCursorWrapper):
 
                     src_ctor = self.key_to_constructor.get(curr)
                     is_fk = (src_ctor is not None and src_ctor[1] and
-                             isinstance(src_ctor[0]._meta.fields.get(attr),
-                                        ForeignKeyField))
+                             (isinstance(src_ctor[0]._meta.fields.get(attr),
+                                         ForeignKeyField) or
+                              attr in src_ctor[0]._meta.composite_keys))
                     # (src, attr, dest, src is dict?, is outer?,
                     # attr is src's fk?).
                     self.src_to_dest.append((
@@ -9333,11 +9657,10 @@ class PrefetchQuery(collections.namedtuple('_PrefetchQuery', (
             if is_backref:
                 if rel_models is None:
                     rel_models = [field.model for field in fields]
-                foreign_key_attrs = [field.rel_field.name for field in fields]
             else:
                 if rel_models is None:
                     rel_models = [field.rel_model for field in fields]
-                foreign_key_attrs = [field.name for field in fields]
+            foreign_key_attrs = [field.name for field in fields]
             field_to_name = list(zip(fields, foreign_key_attrs))
         model = query.model
         return super(PrefetchQuery, cls).__new__(
@@ -9346,16 +9669,17 @@ class PrefetchQuery(collections.namedtuple('_PrefetchQuery', (
     def populate_instance(self, instance, id_map):
         if self.is_backref:
             for field in self.fields:
-                identifier = instance.__data__[field.name]
+                identifier = field.holder_key(instance)
                 key = (field, identifier)
                 if key in id_map:
                     setattr(instance, field.name, id_map[key])
                     # setattr marks the fk dirty, but it isn't - it's the value
                     # we just loaded. Clear it so the row reflects db state.
-                    instance._dirty.discard(field.name)
+                    for local in field.get_local_fields():
+                        instance._dirty.discard(local.name)
         else:
             for field, attname in self.field_to_name:
-                identifier = instance.__data__[field.rel_field.name]
+                identifier = field.rel_key(instance)
                 key = (field, identifier)
                 rel_instances = id_map.get(key, [])
                 for inst in rel_instances:
@@ -9365,7 +9689,10 @@ class PrefetchQuery(collections.namedtuple('_PrefetchQuery', (
 
     def store_instance(self, instance, id_map):
         for field, attname in self.field_to_name:
-            identity = field.rel_field.python_value(instance.__data__[attname])
+            if self.is_backref:
+                identity = field.rel_key(instance, convert=True)
+            else:
+                identity = field.holder_key(instance, convert=True)
             key = (field, identity)
             if self.is_backref:
                 id_map[key] = instance
@@ -9388,28 +9715,50 @@ def _parent_keys(parent_query, cols):
     return sub
 
 
-def _join_parent_keys(query, parent_query, pairs):
+def _join_parent_keys(query, parent_query, groups):
     # The parent query can repeat a key (it may carry its own joins), and a
     # duplicated key would multiply every row of query. Dedupe the keys
     # rather than the query, which is bigger and may carry its own DISTINCT.
-    keys = list(dict.fromkeys([key for _, key in pairs]))
+    # Each group is a list of (column, key) pairs ANDed together, so a
+    # composite foreign-key stays a single unit; groups are ORed.
+    deduped = []
+    seen = set()
+    for group in groups:
+        marker = tuple(key for _, key in group)
+        if marker not in seen:
+            seen.add(marker)
+            deduped.append(group)
+    groups = deduped
+    keys = list(dict.fromkeys([key for group in groups for _, key in group]))
     sub = _parent_keys(parent_query, keys).order_by().distinct()
-    on = reduce(operator.or_, [col == getattr(sub.c, key.column_name)
-                               for col, key in pairs])
+    on = reduce(operator.or_, [
+        reduce(operator.and_, [col == getattr(sub.c, key.column_name)
+                               for col, key in group])
+        for group in groups])
     query = query.join(sub, on=on)
-    if len(pairs) > 1:
+    if len(groups) > 1:
         # Several fks OR'd together can match one row to two distinct keys,
         # which deduping the keys cannot prevent.
         query = query.distinct()
     return query
 
 
-def _relate(query, parent_query, pairs, strategy):
-    # Pairs are (column on query, the column it matches on parent_query).
+def _relate(query, parent_query, groups, strategy):
+    # Groups are lists of (column on query, key column on parent_query). The
+    # columns within a group form one (possibly composite) key and are ANDed;
+    # groups are ORed.
     if strategy == PREFETCH_TYPE.JOIN:
-        return _join_parent_keys(query, parent_query, pairs)
-    expr = reduce(operator.or_, [col << _parent_keys(parent_query, (key,))
-                                 for col, key in pairs])
+        return _join_parent_keys(query, parent_query, groups)
+    exprs = []
+    for group in groups:
+        if len(group) == 1:
+            col, key = group[0]
+            exprs.append(col << _parent_keys(parent_query, (key,)))
+        else:
+            cols, keys = zip(*group)
+            exprs.append(Expression(EnclosedNodeList(cols), OP.IN,
+                                    _parent_keys(parent_query, keys)))
+    expr = reduce(operator.or_, exprs)
     return query.where(expr)
 
 
@@ -9434,9 +9783,14 @@ def prefetch_add_subquery(sq, subqueries, prefetch_type):
             rels = subquery_model._meta.model_refs.get(last_model, [])
             if rels:
                 fks = [getattr(subquery_model, fk.name) for fk in rels]
-                pks = [getattr(last_obj, fk.rel_field.name) for fk in rels]
+                groups = [fk.join_columns(subquery_model, last_obj)
+                          for fk in rels]
             else:
                 backrefs = subquery_model._meta.model_backrefs.get(last_model)
+                if backrefs:
+                    groups = [[(ref_col, holder_col) for holder_col, ref_col
+                               in bk.join_columns(last_obj, subquery_model)]
+                              for bk in backrefs]
             if (fks or backrefs) and ((target_model is last_obj) or
                                       (target_model is None)):
                 break
@@ -9449,13 +9803,10 @@ def prefetch_add_subquery(sq, subqueries, prefetch_type):
         dest = (target_model,) if target_model else None
 
         if fks:
-            subquery = _relate(subquery, last_query, list(zip(fks, pks)),
-                               prefetch_type)
+            subquery = _relate(subquery, last_query, groups, prefetch_type)
             fixed_queries.append(PrefetchQuery(subquery, fks, False, dest))
         elif backrefs:
-            pairs = [(getattr(subquery_model, backref.rel_field.name),
-                      getattr(last_obj, backref.name)) for backref in backrefs]
-            subquery = _relate(subquery, last_query, pairs, prefetch_type)
+            subquery = _relate(subquery, last_query, groups, prefetch_type)
             fixed_queries.append(PrefetchQuery(subquery, backrefs, True, dest))
 
     return fixed_queries
@@ -9501,15 +9852,15 @@ def prefetch(sq, *subqueries, **kwargs):
 def _bucket(field, is_backref, children, parents):
     # Single-relation bucketing on the raw fk/key values writes __rel__ and
     # backref lists directly, skipping descriptor and dirty tracking.
-    name, rel_name = field.name, field.rel_field.name
+    name = field.name
     if is_backref:
         # children carry the fk, parents get backref lists.
         buckets = {}
         for child in children:
-            buckets.setdefault(child.__data__[name], []).append(child)
+            buckets.setdefault(field.holder_key(child), []).append(child)
         backref = field.backref
         for parent in parents:
-            rel = buckets.get(parent.__data__[rel_name], [])
+            rel = buckets.get(field.rel_key(parent), [])
             for inst in rel:
                 inst.__rel__[name] = parent
             setattr(parent, backref, rel)
@@ -9517,9 +9868,9 @@ def _bucket(field, is_backref, children, parents):
         # children are the referenced rows, parents carry the fk.
         id_map = {}
         for child in children:
-            id_map[child.__data__[rel_name]] = child
+            id_map[field.rel_key(child)] = child
         for parent in parents:
-            key = parent.__data__[name]
+            key = field.holder_key(parent)
             if key in id_map:
                 parent.__rel__[name] = id_map[key]
 
@@ -9551,6 +9902,10 @@ class Load(Node):
             return rel.field, True
         elif isinstance(rel, ForeignKeyField):
             return rel, False
+        elif isinstance(rel, CompositeBackrefAccessor):
+            return rel.field, True
+        elif isinstance(rel, CompositeForeignKey):
+            return rel, False
         raise ValueError('Load() expects a foreign-key or backref reference, '
                          'got %r.' % rel)
 
@@ -9568,32 +9923,50 @@ class Load(Node):
         keys, seen = [], set()
         for parent in parents:
             key = get_key(parent)
-            if key is not None and key not in seen:
+            if key is None or (isinstance(key, tuple) and None in key):
+                # Skip missing or partially-null composite keys rather than
+                # querying on a subset of the columns.
+                continue
+            if key not in seen:
                 seen.add(key)
                 keys.append(key)
         return keys
+
+    @staticmethod
+    def _keys_expression(columns, keys):
+        if not keys:
+            return SQL('0 = 1')
+        if len(columns) == 1:
+            return columns[0] << keys
+        return reduce(operator.or_, [
+            reduce(operator.and_, [column == value
+                                   for column, value in zip(columns, key)])
+            for key in keys])
 
     def _link_children(self, query, parent_query, parents):
         # MATERIALIZE: use the parents' in-memory keys, not a subquery.
         field = self._field
         if self._strategy == PREFETCH_TYPE.MATERIALIZE:
-            keys = self._distinct(parents,
-                                  lambda p: getattr(p, field.rel_field.name))
-            return query.where(field << keys)
+            keys = self._distinct(parents, field.rel_key)
+            return query.where(
+                self._keys_expression(field.get_local_fields(), keys))
         # Resolve the key on parent_query.model so aliased parents render
         # against their alias.
-        pk = getattr(parent_query.model, field.rel_field.name)
-        return _relate(query, parent_query, [(field, pk)], self._strategy)
+        group = [(local, getattr(parent_query.model, rel.name))
+                 for local, rel in zip(field.get_local_fields(),
+                                       field.get_rel_fields())]
+        return _relate(query, parent_query, [group], self._strategy)
 
     def _link_parent(self, query, parent_query, parents):
         field = self._field
         if self._strategy == PREFETCH_TYPE.MATERIALIZE:
-            keys = self._distinct(parents,
-                                  lambda p: p.__data__.get(field.name))
-            return query.where(field.rel_field << keys)
-        fk = getattr(parent_query.model, field.name)
-        return _relate(query, parent_query, [(field.rel_field, fk)],
-                       self._strategy)
+            keys = self._distinct(parents, field.holder_key)
+            return query.where(
+                self._keys_expression(field.get_rel_fields(), keys))
+        group = [(rel, getattr(parent_query.model, local.name))
+                 for local, rel in zip(field.get_local_fields(),
+                                       field.get_rel_fields())]
+        return _relate(query, parent_query, [group], self._strategy)
 
     def _run(self, parents, parent_query, depth=0, database=None):
         field = self._field
@@ -9612,7 +9985,7 @@ class Load(Node):
         return children, child_query
 
     @staticmethod
-    def _rank_term(term, pks, field):
+    def _rank_term(term, pks, local_fields):
         # Aggregate non-grouped order terms (MIN asc / MAX desc) so a to-many
         # join cannot rank one child twice.
         o = term if isinstance(term, Ordering) else Asc(term)
@@ -9620,7 +9993,8 @@ class Load(Node):
         if isinstance(node, SQL):
             raise ValueError('per_parent cannot rank by a SQL() literal, '
                              'order by a field or expression instead.')
-        if node is field or any(node is pk for pk in pks):
+        if any(node is f for f in local_fields) or \
+                any(node is pk for pk in pks):
             return term
         agg = fn.MAX(node) if 'DESC' in o.direction.upper() else fn.MIN(node)
         return Ordering(agg, o.direction, o.collation, o.nulls)
@@ -9635,14 +10009,15 @@ class Load(Node):
             raise ValueError('per_parent is not supported with a grouped or '
                              'aggregate relation query.')
         pks = rel_model._meta.get_primary_keys()
-        order = [self._rank_term(o, pks, field)
+        local_fields = field.get_local_fields()
+        order = [self._rank_term(o, pks, local_fields)
                  for o in (base._order_by or pks)]
         rn = (fn.ROW_NUMBER()
-              .over(partition_by=[field], order_by=order)
+              .over(partition_by=list(local_fields), order_by=order)
               .alias('_rn'))
         # Collapse row-multiplying joins to one row per child before ranking.
         inner = (base.select(*pks, rn).order_by().limit(None).offset(None)
-                 .group_by(*pks, field))
+                 .group_by(*pks, *local_fields))
         # Unique name per depth so a nested windowed parent doesn't collide.
         cte = (self._link_children(inner, parent_query, parents)
                .cte('_load_ranked_%d' % depth))

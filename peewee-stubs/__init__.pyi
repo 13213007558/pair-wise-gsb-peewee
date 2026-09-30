@@ -1733,6 +1733,41 @@ class CompositeKey(MetaField):
     column_name: Incomplete
     def bind(self, model, name, set_attribute: bool = True) -> None: ...
 
+class CompositeForeignKey(MetaField):
+    accessor_class: Incomplete
+    backref_accessor_class: Incomplete
+    rel_model: Incomplete
+    local_fields: Incomplete
+    rel_fields: Incomplete
+    backref: Incomplete
+    on_delete: Incomplete
+    on_update: Incomplete
+    deferrable: Incomplete
+    deferred: Incomplete
+    lazy_load: Incomplete
+    constraint_name: str | None
+    def __init__(
+        self,
+        model,
+        fields,
+        backref=None,
+        on_delete=None,
+        on_update=None,
+        deferrable=None,
+        lazy_load: bool = True,
+        null: bool | None = None,
+        constraint_name: str | None = None,
+    ) -> None: ...
+    def bind(self, model, name, set_attribute: bool = True) -> None: ...
+    def get_local_fields(self) -> tuple: ...
+    def get_rel_fields(self) -> tuple: ...
+    def holder_key(self, instance, convert: bool = False): ...
+    def rel_key(self, instance, convert: bool = False): ...
+    def null_assignments(self) -> dict: ...
+    def get_constraint_name(self) -> str: ...
+    def foreign_key_constraint(self, explicit_name: bool = False) -> NodeList: ...
+    def join_columns(self, holder, referenced) -> list: ...
+
 class _SortedFieldList:
     __slots__ = ("_keys", "_items")
     def __init__(self) -> None: ...
@@ -2154,6 +2189,7 @@ __all__ = [
     "Check",
     "chunked",
     "Column",
+    "CompositeForeignKey",
     "CompositeKey",
     "Context",
     "Database",
