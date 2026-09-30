@@ -19,6 +19,8 @@ from . import models
 MODULES.append(models)
 from . import model_sql
 MODULES.append(model_sql)
+from . import composite_foreign_keys
+MODULES.append(composite_foreign_keys)
 from . import prefetch_tests
 MODULES.append(prefetch_tests)
 from . import results
